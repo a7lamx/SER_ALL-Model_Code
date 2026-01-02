@@ -1,0 +1,1051 @@
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import os, glob
+import librosa
+import librosa.display
+import IPython
+from IPython.display import Audio
+from IPython.display import Image
+import warnings; warnings.filterwarnings('ignore') #matplot lib complains about librosa
+!pip install webrtcvad
+#google colab has an old version of librosa with missing mel spectrogram args (for MFCC); upgrade to current
+!pip install -U librosa
+                                                                               
+# needed to import dataset from google drive into colab
+from google.colab import drive
+drive.mount("/content/drive")
+waveforms, emotions = [],[]
+import numpy as np
+import librosa
+
+# Set your sample rate
+sample_rate = 16000
+
+def feature_melspectrogram(waveform, sample_rate, fft=1024, winlen=512, window='hamming', hop=256, mels=40):
+    melspectrogram = librosa.feature.melspectrogram(
+        y=waveform,
+        sr=sample_rate,
+        n_fft=fft,
+        win_length=winlen,
+        window=window,
+        hop_length=hop,
+        n_mels=mels,
+        fmax=sample_rate/2)
+    melspectrogram = librosa.power_to_db(melspectrogram, ref=np.max)
+    return melspectrogram
+
+def feature_mfcc(waveform, sample_rate, n_mfcc=40, fft=1024, winlen=512, window='hamming', hop=256, mels=40):
+    mfc_coefficients = librosa.feature.mfcc(
+        y=waveform,
+        sr=sample_rate,
+        n_mfcc=n_mfcc,
+        n_fft=fft,
+        win_length=winlen,
+        window=window,
+        hop_length=hop,
+        n_mels=mels,
+        fmax=sample_rate/2)
+    return mfc_coefficients
+
+
+
+def combine_features(mfccs, mels):
+    combined_features = np.concatenate((mfccs, mels), axis=0)
+    return combined_features
+
+# Assuming you have already computed MFCCs and Mel spectrograms for a set of waveforms
+mfcc_features = []
+mel_features = []
+
+# Process each waveform to get MFCC and Mel features
+for waveform in waveforms:
+    mfccs = feature_mfcc(waveform, sample_rate, winlen=512, hop=256)
+    mel = feature_melspectrogram(waveform, sample_rate, winlen=512, hop=256)
+    mfcc_features.append(mfccs)
+    mel_features.append(mel)
+
+# Convert the lists to numpy arrays
+    mfcc_features = np.array(mfcc_features)
+    mel_features = np.array(mel_features)
+
+# Make sure both feature sets have the same number of time steps
+    min_time_steps = min(mfcc_features.shape[2], mel_features.shape[2])
+    mfcc_features = mfcc_features[:, :, :min_time_steps]
+    mel_features = mel_features[:, :, :min_time_steps]
+
+# Combine MFCC and Mel features
+    combined_features = combine_features(mfcc_features, mel_features)
+
+
+
+
+def get_features(waveforms, features, samplerate):
+    file_count = 0
+
+    for waveform in waveforms:
+        mfccs = feature_mfcc(waveform, sample_rate)  # Compute MFCCs
+        mel = feature_melspectrogram(waveform, sample_rate)  # Compute Mel spectrogram
+        mfcc_mel = combine_features(mfccs, mel)  # Combine MFCCs and Mel spectrograms
+        features.append(mfcc_mel)
+        file_count += 1
+        print('\r' + f' Processed {file_count}/{len(waveforms)} waveforms', end='')
+
+
+    return features
+
+
+
+
+def get_waveforms(file):
+
+    # load an individual sample audio file
+    # read the full 3 seconds of the file, cut off the first 0.5s of silence; native sample rate = 48k
+    # don't need to store the sample rate that librosa.load returns
+    waveform, _ = librosa.load(file, duration=5, offset=0.5, sr=sample_rate)
+
+    # make sure waveform vectors are homogenous by defining explicitly
+    waveform_homo = np.zeros((int(sample_rate*5,)))
+    waveform_homo[:len(waveform)] = waveform
+
+    # return a single file's waveform
+    return waveform_homo
+
+# RAVDESS dataset emotions
+# shift emotions left to be 0 indexed for PyTorch
+
+
+emotions_dict = {
+  '0':'boredom,sigh',
+  '1':'Neutral',
+  '2':'Happy',
+  '3':'Sad',
+  '4':'Angry',
+  '5':'Fearful ',
+  '6':' Disgust',
+  '7':' Surprised',
+  '8':' excited',
+  '9':' pleasure',
+  '10':' pain',
+  '11':' disappointmen',
+  '12':' breath'}
+
+
+import os
+import glob
+import wave
+import webrtcvad
+import numpy as np
+import librosa
+import librosa.display
+
+# Define the path to data for glob
+data_path = "/content/drive/MyDrive/ASVP-ESD-Update 2/*/actor_*/*.wav"
+
+# Initialize Webrtcvad instance
+aggressiveness = 1
+
+# Initialize Vad with the specified aggressiveness level
+vad = webrtcvad.Vad(aggressiveness)
+
+# Constants for silence removal
+FRAME_DURATION = 30  # Duration of each frame in milliseconds
+MIN_SILENCE_DURATION = 500  # Minimum duration of silence in milliseconds
+
+def remove_silence(waveform, sample_rate):
+    # Convert waveform to int16 for Webrtcvad
+    waveform = np.int16(waveform * 32768)
+
+    # Split waveform into frames
+    frame_duration = FRAME_DURATION
+    frame_size = int(sample_rate * frame_duration / 1000)
+    num_frames = len(waveform) // frame_size
+    frames = [waveform[i * frame_size : (i + 1) * frame_size] for i in range(num_frames)]
+
+    # Determine which frames contain speech (non-silent) regions
+    non_silent_frames = [frame for frame in frames if vad.is_speech(frame.tobytes(), sample_rate)]
+
+    if not non_silent_frames:
+        # If there are no non-silent frames, return the original waveform
+        return waveform
+
+    # Concatenate non-silent frames to obtain the de-silenced waveform
+    de_silenced_waveform = np.concatenate(non_silent_frames)
+
+    return de_silenced_waveform
+
+
+
+def denoise_waveform(waveform):
+    # Convert waveform to floating-point format
+    waveform = waveform.astype(np.float32)
+
+    # Apply spectral subtraction for denoising using librosa.stft
+    stft = librosa.stft(waveform)
+    stft_denoised = np.abs(stft) - np.abs(librosa.stft(librosa.istft(stft)))
+    waveform_denoised = librosa.istft(stft_denoised)
+
+    return waveform_denoised
+
+
+def preemphasis(waveform, coefficient=0.97):
+    # Apply pre-emphasis to the waveform
+    waveform_preemphasized = np.append(waveform[0], waveform[1:] - coefficient * waveform[:-1])
+
+    return waveform_preemphasized
+
+
+def load_data():
+    # Features and labels
+    emotions = []
+    waveforms = []
+    file_names = []
+    # Get the list of audio files
+    audio_files = glob.glob(data_path)
+
+    # Count the total number of audio samples
+    total_samples = len(audio_files)
+
+    # Progress counter
+    file_count = 0
+
+    for file in audio_files:
+        # Get file name with labels
+        file_name = os.path.basename(file)
+
+        # Get emotion label from the sample's file
+        emotion = (file_name.split("-")[2])
+
+        # Move surprise to 0 for cleaner behavior with PyTorch/0-indexing
+        if emotion == "01":
+            emotion = 0 # emotion = 0  # boredom
+        elif emotion == "02":
+            emotion = 1  # Neutral
+        elif emotion == "03":
+            emotion = 2  # Happy
+        elif emotion == "04":
+            emotion = 3  # Sad
+        elif emotion == "05":
+            emotion = 4  # Angry
+        elif emotion == "06":
+             emotion = 5  # Fearful
+        elif emotion == "07":
+             emotion = 6  # Disgust
+        elif emotion == "08":
+            emotion = 7 # emotion = 7  # Surprised
+        elif emotion == "09":
+            emotion = 8  # excited
+        elif emotion == "10":
+            emotion = 9  # pleasure
+        elif emotion == "11":
+            emotion = 10  # pain
+        elif emotion == "12":
+            emotion = 11  # disappointmen
+        elif emotion == "13":
+             emotion = 12  # breath
+
+        # Load waveform from the sample
+        waveform, sample_rate = librosa.load(file, sr=None)
+
+        # Preprocess waveform
+        waveform = waveform.astype(np.float32)  # Convert to floating-point format
+        waveform = remove_silence(waveform,sample_rate)
+        waveform = denoise_waveform(waveform)
+        waveform = preemphasis(waveform)
+
+        # get waveform from the sample
+        waveform = get_waveforms(file)
+
+        # Store waveform and label
+        waveforms.append(waveform)
+        emotions.append(emotion)
+        file_names.append(file_name)
+
+        file_count += 1
+        # Keep track of data loader's progress
+
+        # Keep track of data loader's progress
+        print('\r'+f'Processed {file_count}/{total_samples} audio samples', end='')
+
+    return waveforms, emotions, file_names
+
+# load data
+# init explicitly to prevent data leakage from past sessions, since load_data() appends
+waveforms, emotions, file_names = [],[],[]
+waveforms, emotions, file_names = load_data()
+  
+  print(f'Waveforms set: {len(waveforms)} samples')
+# we have 6350 waveforms but we need to know their length too; should be 3 sec * 48k = 144k
+print(f'Waveform signal length: {len(waveforms[0])}') #when we multplay sr*3
+print(f'Emotions set: {len(emotions)} sample labels')
+print(f'file_names : {len(file_names)} names')
+# create storage for train, validation, test sets and their indices
+train_set,valid_set,test_set = [],[],[]
+X_train,X_valid,X_test = [],[],[]
+y_train,y_valid,y_test = [],[],[]
+
+# convert waveforms to array for processing
+waveforms = np.array(waveforms)
+
+# process each emotion separately to make sure we builf balanced train/valid/test sets
+for emotion_num in range(len(emotions_dict)):
+
+    # find all indices of a single unique emotion
+    emotion_indices = [index for index, emotion in enumerate(emotions) if emotion==emotion_num]
+
+    # seed for reproducibility
+    np.random.seed(69)
+    # shuffle indicies
+    emotion_indices = np.random.permutation(emotion_indices)
+
+    # store dim (length) of the emotion list to make indices
+    dim = len(emotion_indices)
+
+    # store indices of training, validation and test sets in 80/10/10 proportion
+    # train set is first 80%
+    train_indices = emotion_indices[:int(0.8*dim)]
+    # validation set is next 10% (between 80% and 90%)
+    valid_indices = emotion_indices[int(0.8*dim):int(0.9*dim)]
+    # test set is last 10% (between 90% - end/100%)
+    test_indices = emotion_indices[int(0.9*dim):]
+
+    # create train waveforms/labels sets
+    X_train.append(waveforms[train_indices,:])
+    y_train.append(np.array([emotion_num]*len(train_indices),dtype=np.int32))
+    # create validation waveforms/labels sets
+    X_valid.append(waveforms[valid_indices,:])
+    y_valid.append(np.array([emotion_num]*len(valid_indices),dtype=np.int32))
+    # create test waveforms/labels sets
+    X_test.append(waveforms[test_indices,:])
+    y_test.append(np.array([emotion_num]*len(test_indices),dtype=np.int32))
+
+    # store indices for each emotion set to verify uniqueness between sets
+    train_set.append(train_indices)
+    valid_set.append(valid_indices)
+    test_set.append(test_indices)
+
+# concatenate, in order, all waveforms back into one array
+X_train = np.concatenate(X_train,axis=0)
+X_valid = np.concatenate(X_valid,axis=0)
+X_test = np.concatenate(X_test,axis=0)
+
+# concatenate, in order, all emotions back into one array
+y_train = np.concatenate(y_train,axis=0)
+y_valid = np.concatenate(y_valid,axis=0)
+y_test = np.concatenate(y_test,axis=0)
+
+# combine and store indices for all emotions' train, validation, test sets to verify uniqueness of sets
+train_set = np.concatenate(train_set,axis=0)
+valid_set = np.concatenate(valid_set,axis=0)
+test_set = np.concatenate(test_set,axis=0)
+
+# check shape of each set
+print(f'Training waveforms:{X_train.shape}, y_train:{y_train.shape}')
+print(f'Validation waveforms:{X_valid.shape}, y_valid:{y_valid.shape}')
+print(f'Test waveforms:{X_test.shape}, y_test:{y_test.shape}')
+
+# make sure train, validation, test sets have no overlap/are unique
+# get all unique indices across all sets and how many times each index appears (count)
+uniques, count = np.unique(np.concatenate([train_set,test_set,valid_set],axis=0), return_counts=True)
+
+# if each index appears just once, and we have 1440 such unique indices, then all sets are unique
+if sum(count==1) == len(emotions):
+    print(f'\nSets are unique: {sum(count==1)} samples out of {len(emotions)} are unique')
+else:
+    print(f'\nSets are NOT unique: {sum(count==1)} samples out of {len(emotions)} are unique')
+
+# initialize feature arrays
+# We extract MFCC features from waveforms and store in respective 'features' array
+features_train, features_valid, features_test = [],[],[]
+
+print('Train waveforms:') # get training set features
+features_train = get_features(X_train, features_train, sample_rate)
+
+print('\n\nValidation waveforms:') # get validation set features
+features_valid = get_features(X_valid, features_valid, sample_rate)
+
+print('\n\nTest waveforms:') # get test set features
+features_test = get_features(X_test, features_test, sample_rate)
+
+print(f'\n\nFeatures set: {len(features_train)+len(features_test)+len(features_valid)} total, {len(features_train)} train, {len(features_valid)} validation, {len(features_test)} test samples')
+print(f'Features (MFC coefficient matrix) shape: {len(features_train[0])} mel frequency coefficients x {len(features_train[0][1])} time steps')
+
+  
+def awgn_augmentation(waveform, multiples=1, bits=16, snr_min=15, snr_max=30):
+
+    # get length of waveform (should be 3*48k = 144k)
+    wave_len = len(waveform)
+
+    # Generate normally distributed (Gaussian) noises
+    # one for each waveform and multiple (i.e. wave_len*multiples noises)
+    noise = np.random.normal(size=(multiples, wave_len))
+
+    # Normalize waveform and noise
+    norm_constant = 2.0**(bits-1)
+    norm_wave = waveform / norm_constant
+    norm_noise = noise / norm_constant
+
+    # Compute power of waveform and power of noise
+    signal_power = np.sum(norm_wave ** 2) / wave_len
+    noise_power = np.sum(norm_noise ** 2, axis=1) / wave_len
+
+    # Choose random SNR in decibels in range [15,30]
+    snr = np.random.randint(snr_min, snr_max)
+
+    # Apply whitening transformation: make the Gaussian noise into Gaussian white noise
+    # Compute the covariance matrix used to whiten each noise
+    # actual SNR = signal/noise (power)
+    # actual noise power = 10**(-snr/10)
+    covariance = np.sqrt((signal_power / noise_power) * 10 ** (- snr / 10))
+    # Get covariance matrix with dim: (144000, 2) so we can transform 2 noises: dim (2, 144000)
+    covariance = np.ones((wave_len, multiples)) * covariance
+
+    # Since covariance and noise are arrays, * is the haddamard product
+    # Take Haddamard product of covariance and noise to generate white noise
+    multiple_augmented_waveforms = waveform + covariance.T * noise
+
+    return multiple_augmented_waveforms
+
+
+      def augment_waveforms(waveforms, features, emotions, multiples):
+    # keep track of how many waveforms we've processed so we can add correct emotion label in the same order
+    emotion_count = 0
+    # keep track of how many augmented samples we've added
+    added_count = 0
+
+    for waveform in waveforms:
+
+        # Generate 2 augmented multiples of the dataset, i.e. 1440 native + 1440*2 noisy = 4320 samples total
+        augmented_waveforms = awgn_augmentation(waveform, multiples=multiples)
+
+        # compute spectrogram for each of 2 augmented waveforms
+        for augmented_waveform in augmented_waveforms:
+
+            # Get the combined features for the augmented waveform
+            augmented_combined_features = get_features([augmented_waveform], [], sample_rate)[0]
+
+            # append the augmented combined features to the rest of the native data
+            features.append(augmented_combined_features)
+            emotions = np.append(emotions, emotions[emotion_count])  # Append emotion value for each augmented sample
+
+            # keep track of new augmented samples
+            added_count += 1
+
+            # check progress
+            print('\r'+f'Processed {emotion_count + 1}/{len(waveforms)} waveforms for {added_count}/{len(waveforms)*multiples} new augmented samples',end='')
+
+        # keep track of the emotion labels to append in order
+        emotion_count += 1
+
+        # store augmented waveforms to check their shape
+        augmented_waveforms_temp.append(augmented_waveforms)
+
+    return features, emotions
+
+# Initialize the list to store augmented waveforms
+augmented_waveforms_temp = []
+
+# Specify multiples of our dataset to add as augmented data
+multiples = 1
+
+print('Train waveforms:') # augment waveforms of the training set
+features_train , y_train = augment_waveforms(X_train, features_train, y_train, multiples)
+
+# Check the new shape of the extracted features and data:
+print(f'\n\nNative + Augmented Features set: {len(features_train)} total')
+print(f'{len(y_train)} training sample labels, {len(y_valid)} validation sample labels, {len(y_test)} test sample labels')
+print(f'Features (Combined MFCC and Mel) shape: {features_train[0].shape}')
+
+# need to make dummy input channel for CNN input feature tensor
+X_train = np.expand_dims(features_train,1)
+X_valid = np.expand_dims(features_valid, 1)
+X_test = np.expand_dims(features_test,1)
+
+# convert emotion labels from list back to numpy arrays for PyTorch to work with
+y_train = np.array(y_train)
+y_valid = np.array(y_valid)
+y_test = np.array(y_test)
+
+# confiorm that we have tensor-ready 4D data array
+# should print (batch, channel, width, height) == (4320, 1, 128, 282) when multiples==2
+print(f'Shape of 4D feature array for input tensor: {X_train.shape} train, {X_valid.shape} validation, {X_test.shape} test')
+print(f'Shape of emotion labels: {y_train.shape} train, {y_valid.shape} validation, {y_test.shape} test')
+# free up some RAM - no longer need full feature set or any waveforms
+del features_train, features_valid, features_test, waveforms
+
+  from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+
+#### Scale the training data ####
+# store shape so we can transform it back
+N,C,H,W = X_train.shape
+# Reshape to 1D because StandardScaler operates on a 1D array
+# tell numpy to infer shape of 1D array with '-1' argument
+X_train = np.reshape(X_train, (N,-1))
+X_train = scaler.fit_transform(X_train)
+# Transform back to NxCxHxW 4D tensor format
+X_train = np.reshape(X_train, (N,C,H,W))
+
+##### Scale the validation set ####
+N,C,H,W = X_valid.shape
+X_valid = np.reshape(X_valid, (N,-1))
+X_valid = scaler.transform(X_valid)
+X_valid = np.reshape(X_valid, (N,C,H,W))
+
+#### Scale the test set ####
+N,C,H,W = X_test.shape
+X_test = np.reshape(X_test, (N,-1))
+X_test = scaler.transform(X_test)
+X_test = np.reshape(X_test, (N,C,H,W))
+
+# check shape of each set again
+print(f'X_train scaled:{X_train.shape}, y_train:{y_train.shape}')
+print(f'X_valid scaled:{X_valid.shape}, y_valid:{y_valid.shape}')
+print(f'X_test scaled:{X_test.shape}, y_test:{y_test.shape}')
+
+    #MODEL 
+
+
+class CoAttention(nn.Module):
+    def __init__(self, input_size):
+        super(CoAttention, self).__init__()
+
+        self.W1 = nn.Linear(input_size, input_size)
+        self.W2 = nn.Linear(input_size, input_size)
+
+    def forward(self, attended_conv1, attended_conv2):
+        # Ensure both tensors have the same dimensions
+        if attended_conv1.size() != attended_conv2.size():
+            # You can add logic here to resize or reshape attended_conv1 or attended_conv2
+            # to have the same dimensions, depending on your requirements.
+            # For example, if attended_conv1 and attended_conv2 are 32x2880,
+            # you can use a linear layer to reshape them to 32x2880.
+            attended_conv1 = self.W1(attended_conv1)
+            attended_conv2 = self.W2(attended_conv2)
+
+        # Calculate attention weights
+        alpha = torch.sigmoid(attended_conv1 + attended_conv2)
+
+        # Apply attention weights to the embeddings
+        attended_conv1 = attended_conv1 * alpha
+        attended_conv2 = attended_conv2 * alpha
+
+        return attended_conv1, attended_conv2
+
+class HierarchicalCoAttention(nn.Module):
+    def __init__(self, input_size_transformer, input_size_cnn):
+        super(HierarchicalCoAttention, self).__init__()
+
+
+        # Define linear layers to project both embeddings to the common dimension
+
+        self.W_transformer = nn.Linear(input_size_transformer, 128)
+        self.W_cnn = nn.Linear(input_size_cnn, 128)
+
+    def forward(self, cnn_embedding, transformer_embedding):
+        # Project both embeddings to the common dimension
+        transformer_embedding = self.W_transformer(transformer_embedding)
+        cnn_embedding = self.W_cnn(cnn_embedding)
+
+        # Calculate attention weights element-wise
+        alpha = torch.sigmoid(transformer_embedding + cnn_embedding)
+
+        # Apply attention weights to the embeddings
+        attended_cnn_embedding = cnn_embedding * alpha
+        attended_transformer_embedding = transformer_embedding * alpha
+
+        return attended_cnn_embedding, attended_transformer_embedding
+
+
+class parallel_all_you_want(nn.Module):
+    def __init__(self, num_emotions):
+        super().__init__()
+
+
+
+
+
+        ################ TRANSFORMER BLOCK #############################
+        # maxpool the input feature map/tensor to the transformer
+        # a rectangular kernel worked better here for the rectangular input spectrogram feature map/tensor
+        self.transformer_maxpool = nn.MaxPool2d(kernel_size=[1,4], stride=[1,4])
+        self.transformer_dense = nn.Linear(168, 2880)
+        # define single transformer encoder layer
+        # self-attention + feedforward network from "Attention is All You Need" paper
+        # 4 multi-head self-attention layers each with 40-->512--->40 feedforward network
+        transformer_layer = nn.TransformerEncoderLayer(
+            d_model=168, # input feature (frequency) dim after maxpooling 40*282 -> 40*70 (MFC*time)
+            nhead=4, # 4 self-attention layers in each multi-head self-attention layer in each encoder block
+            dim_feedforward=512, # 2 linear layers in each encoder block's feedforward network: dim 40-->512--->40
+            dropout=0.4,
+            activation='relu' # ReLU: avoid saturation/tame gradient/reduce compute time
+        )
+
+        # I'm using 4 instead of the 6 identical stacked encoder layrs used in Attention is All You Need paper
+        # Complete transformer block contains 4 full transformer encoder layers (each w/ multihead self-attention+feedforward)
+        self.transformer_encoder = nn.TransformerEncoder(transformer_layer, num_layers=4)
+
+
+        # Initialize the co-attention layers
+        self.co_attention1 = CoAttention(input_size=2472)
+        self.co_attention2 = HierarchicalCoAttention(2880, 2880)
+
+       ############### 1ST PARALLEL 2D CONVOLUTION BLOCK ############
+        # 3 sequential conv2D layers: (1,40,282) --> (16, 20, 141) -> (32, 5, 35) -> (64, 1, 8)
+        self.conv2Dblock1 = nn.Sequential(
+
+            # 1st 2D convolution layer
+            nn.Conv2d(
+                in_channels=1, # input volume depth == input channel dim == 1
+                out_channels=16, # expand output feature map volume's depth to 16
+                kernel_size=3, # typical 3*3 stride 1 kernel
+                stride=1,
+                padding=1
+                      ),
+            nn.BatchNorm2d(16), # batch normalize the output feature map before activation
+            nn.LeakyReLU(negative_slope=0.01), # feature map --> activation map
+            nn.MaxPool2d(kernel_size=2, stride=2), #typical maxpool kernel size
+            nn.Dropout(p=0.3), #randomly zero 30% of 1st layer's output feature map in training
+
+            # 2nd 2D convolution layer identical to last except output dim, maxpool kernel
+            nn.Conv2d(
+                in_channels=16,
+                out_channels=32, # expand output feature map volume's depth to 32
+                kernel_size=3,
+                stride=1,
+                padding=1
+                      ),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.MaxPool2d(kernel_size=4, stride=4), # increase maxpool kernel for subsequent filters
+            nn.Dropout(p=0.3),
+
+            # 3rd 2D convolution layer identical to last except output dim
+            nn.Conv2d(
+                in_channels=32,
+                out_channels=64, # expand output feature map volume's depth to 64
+                kernel_size=3,
+                stride=1,
+                padding=1
+                      ),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.MaxPool2d(kernel_size=4, stride=4),
+            nn.Dropout(p=0.3),
+        )
+        ############### 2ND PARALLEL 2D CONVOLUTION BLOCK ############
+        # 3 sequential conv2D layers: (1,40,282) --> (16, 20, 141) -> (32, 5, 35) -> (64, 1, 8)
+        self.conv2Dblock2 = nn.Sequential(
+
+            # 1st 2D convolution layer
+            nn.Conv2d(
+                in_channels=1, # input volume depth == input channel dim == 1
+                out_channels=16, # expand output feature map volume's depth to 16
+                kernel_size=3, # typical 3*3 stride 1 kernel
+                stride=1,
+                padding=1
+                      ),
+            nn.BatchNorm2d(16), # batch normalize the output feature map before activation
+            nn.LeakyReLU(negative_slope=0.01), # feature map --> activation map
+            nn.MaxPool2d(kernel_size=2, stride=2), #typical maxpool kernel size
+            nn.Dropout(p=0.3), #randomly zero 30% of 1st layer's output feature map in training
+
+            # 2nd 2D convolution layer identical to last except output dim, maxpool kernel
+            nn.Conv2d(
+                in_channels=16,
+                out_channels=32, # expand output feature map volume's depth to 32
+                kernel_size=3,
+                stride=1,
+                padding=1
+                      ),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.MaxPool2d(kernel_size=4, stride=4), # increase maxpool kernel for subsequent filters
+            nn.Dropout(p=0.3),
+
+            # 3rd 2D convolution layer identical to last except output dim
+            nn.Conv2d(
+                in_channels=32,
+                out_channels=64, # expand output feature map volume's depth to 64
+                kernel_size=3,
+                stride=1,
+                padding=1
+                      ),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.MaxPool2d(kernel_size=4, stride=4),
+            nn.Dropout(p=0.3),
+        )
+
+        ################# FINAL LINEAR BLOCK ####################
+        # Linear softmax layer to take final concatenated embedding tensor
+        #    from parallel 2D convolutional and transformer blocks, output 8 logits
+        # Each full convolution block outputs (64*1*7) embedding flattened to dim 512 1D array
+        # Full transformer block outputs 40*70 feature map, which we time-avg to dim 40 1D array
+        # 512*2+40 == 1064 input features --> 8 output emotions
+
+
+
+        self.fc1_linear = nn.Linear(128,num_emotions)
+
+        # Add the dense layer to change transformer output dimensions
+
+
+        ### Softmax layer for the 8 output logits from final FC linear layer
+        self.softmax_out = nn.Softmax(dim=1) # dim==1 is the freq embedding
+
+
+
+    def forward(self, x):
+
+        ############ 1st parallel Conv2D block: 4 Convolutional layers ############################
+        # create final feature embedding from 1st convolutional layer
+        # input features pased through 4 sequential 2D convolutional layers
+        conv2d_embedding1 = self.conv2Dblock1(x) # x == N/batch * channel * freq * time
+
+        # flatten final 64*1*8 feature map from convolutional layers to length 512 1D array
+        # skip the 1st (N/batch) dimension when flattening
+        conv2d_embedding1 = torch.flatten(conv2d_embedding1, start_dim=1)
+      #  print("conv2d_embedding1 shape:", conv2d_embedding1.shape)
+
+        ############ 2nd parallel Conv2D block: 4 Convolutional layers #############################
+        # create final feature embedding from 2nd convolutional layer
+        # input features pased through 4 sequential 2D convolutional layers
+        conv2d_embedding2 = self.conv2Dblock2(x) # x == N/batch * channel * freq * time
+
+        # flatten final 64*1*8 feature map from convolutional layers to length 512 1D array
+        # skip the 1st (N/batch) dimension when flattening
+        conv2d_embedding2 = torch.flatten(conv2d_embedding2, start_dim=1)
+      #  print("conv2d_embedding2 shape:", conv2d_embedding2.shape)
+
+
+        # Calculate the co-attended embeddings
+        attended_conv1, attended_conv2 = self.co_attention1(conv2d_embedding1, conv2d_embedding2)
+
+        # Fuse the embeddings using co-attention
+        coattended_embeddings = attended_conv1 + attended_conv2
+      #  print("coattended_embeddings shape:", coattended_embeddings.shape)
+
+        x_maxpool = self.transformer_maxpool(x)
+
+        # remove channel dim: 1*40*70 --> 40*70
+        x_maxpool_reduced = torch.squeeze(x_maxpool,1)
+
+        # convert maxpooled feature map format: batch * freq * time ---> time * batch * freq format
+        # because transformer encoder layer requires tensor in format: time * batch * embedding (freq)
+        x = x_maxpool_reduced.permute(2,0,1)
+
+
+
+        # finally, pass reduced input feature map x into transformer encoder layers
+        transformer_output = self.transformer_encoder(x)
+
+        # create final feature emedding from transformer layer by taking mean in the time dimension (now the 0th dim)
+        # transformer outputs 2x40 (MFCC embedding*time) feature map, take mean of columns i.e. take time average
+        transformer_embedding = torch.mean(transformer_output, dim=0) # dim 40x70 --> 40
+      #  print("transformer_embedding shape:", transformer_embedding.shape)
+
+
+
+        transformer_embedding_lin = self.transformer_dense(transformer_embedding)
+       # print("transformer_embedding_lin shape:", transformer_embedding_lin.shape)
+
+
+        # Calculate the second co-attended embeddings
+        input_size_cnn = coattended_embeddings.shape[1]  # Calculate the input size for CNN
+        input_size_transformer = transformer_embedding_lin.shape[1]  # Calculate the input size for Transformer
+
+        attended_coattended, attended_transformer = self.co_attention2(coattended_embeddings, transformer_embedding_lin)
+
+        # Fuse the second co-attended embeddings
+        final_result = attended_coattended + attended_transformer
+      #  print("final_result shape:", final_result.shape)
+
+        output_logits = self.fc1_linear(final_result)
+      #  print("output_logits shape:", output_logits.shape)
+
+        ######### Final Softmax layer: use logits from FC linear, get softmax for prediction ######
+        output_softmax = self.softmax_out(output_logits)
+       # print("output_softmax shape:", output_softmax.shape)
+
+        # need output logits to compute cross entropy loss, need softmax probabilities to predict class
+        return output_logits, output_softmax
+
+
+# Calculate the input sizes for co-attention
+#input_size_cnn = 2880  # You need to specify this based on your model architecture
+#input_size_transformer = 2880  # You need to specify this based on your model architecture
+
+# Instantiate the model for 8 emotions
+model = parallel_all_you_want(len(emotions_dict))
+
+# Print the model
+print(model)
+import torch
+import torch.nn as nn
+
+# Define the focal loss function
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, predictions, targets):
+        ce_loss = nn.CrossEntropyLoss(reduction='none')(input=predictions, target=targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# Create an instance of the focal loss function
+focal_loss_fn = FocalLoss(alpha=1, gamma=2, reduction='mean')
+
+# Use the focal loss function as the criterion
+def criterion(predictions, targets):
+    return focal_loss_fn(predictions, targets)
+
+optimizer = torch.optim.SGD(model.parameters(),lr=0.001, weight_decay=1e-3, momentum=0.8)
+
+def make_train_step(model, criterion, optimizer):
+    # define the training step of the training phase
+    def train_step(X, Y):
+        # forward pass
+        output_logits, output_softmax = model(X)
+        predictions = torch.argmax(output_softmax, dim=1)
+        accuracy = torch.sum(Y == predictions) / float(len(Y))
+
+        # compute loss on logits because nn.CrossEntropyLoss implements log softmax
+        loss = criterion(output_logits, Y)
+
+        # compute gradients for the optimizer to use
+        loss.backward()
+
+        # update network parameters based on gradient stored (by calling loss.backward())
+        optimizer.step()
+
+        # zero out gradients for next pass
+        optimizer.zero_grad()
+
+        return loss.item(), accuracy * 100
+
+    return train_step
+
+
+def train(optimizer, model, num_epochs, X_train, Y_train, X_valid, Y_valid, patience=10):
+    best_loss = float('inf')
+    counter = 0
+
+
+    for epoch in range(num_epochs):
+        # set model to train phase
+        model.train()
+
+        # ...
+
+        # create tensors from validation set
+        X_valid_tensor = torch.tensor(X_valid, device=device).float()
+        Y_valid_tensor = torch.tensor(Y_valid, dtype=torch.long, device=device)
+
+        # calculate validation metrics to keep track of progress; don't need predictions now
+        valid_loss, valid_acc, _ = validate(X_valid_tensor, Y_valid_tensor)
+
+        # accumulate scalar performance metrics at each epoch to track and plot later
+        train_losses.append(epoch_loss)
+        valid_losses.append(valid_loss)
+
+        # check if the validation loss increased
+        if valid_loss < best_loss:
+            best_loss = valid_loss
+            counter = 0
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"Early stopping at epoch {epoch}.")
+                break
+
+        # keep track of each epoch's progress
+        print(f'\nEpoch {epoch} --- loss:{epoch_loss:.3f}, Epoch accuracy:{epoch_acc:.2f}%, '
+              f'Validation loss:{valid_loss:.3f}, Validation accuracy:{valid_acc:.2f}%')
+
+
+def make_validate_fnc(model,criterion):
+    def validate(X,Y):
+
+        # don't want to update any network parameters on validation passes: don't need gradient
+        # wrap in torch.no_grad to save memory and compute in validation phase:
+        with torch.no_grad():
+
+            # set model to validation phase i.e. turn off dropout and batchnorm layers
+            model.eval()
+
+            # get the model's predictions on the validation set
+            output_logits, output_softmax = model(X)
+            predictions = torch.argmax(output_softmax,dim=1)
+
+            # calculate the mean accuracy over the entire validation set
+            accuracy = torch.sum(Y==predictions)/float(len(Y))
+
+            # compute error from logits (nn.crossentropy implements softmax)
+            loss = criterion(output_logits,Y)
+
+        return loss.item(), accuracy*100, predictions
+    return validate
+
+def make_save_checkpoint():
+    def save_checkpoint(optimizer, model, epoch, filename):
+        checkpoint_dict = {
+            'optimizer': optimizer.state_dict(),
+            'model': model.state_dict(),
+            'epoch': epoch
+        }
+        torch.save(checkpoint_dict, filename)
+    return save_checkpoint
+
+def load_checkpoint(optimizer, model, filename):
+    checkpoint_dict = torch.load(filename)
+    epoch = checkpoint_dict['epoch']
+    model.load_state_dict(checkpoint_dict['model'])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint_dict['optimizer'])
+    return epoch
+  # get training set size to calculate # iterations and minibatch indices
+train_size = X_train.shape[0]
+
+# pick minibatch size (of 32... always)
+minibatch = 16
+
+# set device to GPU
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'{device} selected')
+
+# instantiate model and move to GPU for training
+model = parallel_all_you_want(num_emotions=len(emotions_dict)
+).to(device)
+
+# encountered bugs in google colab only, unless I explicitly defined optimizer in this cell...
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-3, momentum=0.8)
+
+# instantiate the checkpoint save function
+save_checkpoint = make_save_checkpoint()
+
+# instantiate the training step function
+train_step = make_train_step(model, criterion, optimizer=optimizer)
+
+# instantiate the validation loop function
+validate = make_validate_fnc(model, criterion)
+
+# instantiate lists to hold scalar performance metrics to plot later
+train_losses = []
+valid_losses = []
+
+# create training loop for one complete epoch (entire training set)
+def train(optimizer, model, num_epochs, X_train, Y_train, X_valid, Y_valid):
+    best_loss = float('inf')  # Initialize the best loss with a large value
+    patience = 10  # Number of epochs to wait before stopping if the loss doesn't improve
+    patience_counter = 0  # Counter to keep track of the number of epochs with no improvement
+
+    for epoch in range(num_epochs):
+        # set model to train phase
+        model.train()
+
+        # shuffle entire training set in each epoch to randomize minibatch order
+        train_indices = np.random.permutation(train_size)
+
+        # shuffle the training set for each epoch:
+        X_train = X_train[train_indices, :, :, :]
+        Y_train = Y_train[train_indices]
+
+        # instantiate scalar values to keep track of progress after each epoch so we can stop training when appropriate
+        epoch_acc = 0
+        epoch_loss = 0
+        num_iterations = int(train_size / minibatch)
+
+        # create a loop for each minibatch of 32 samples:
+        for i in range(num_iterations):
+            # we have to track and update minibatch position for the current minibatch
+            # if we take a random batch position from a set, we almost certainly will skip some of the data in that set
+            # track minibatch position based on iteration number:
+            batch_start = i * minibatch
+            # ensure we don't go out of the bounds of our training set:
+            batch_end = min(batch_start + minibatch, train_size)
+            # ensure we don't have an index error
+            actual_batch_size = batch_end - batch_start
+
+            # get training minibatch with all channels and 2D feature dims
+            X = X_train[batch_start:batch_end, :, :, :]
+            # get training minibatch labels
+            Y = Y_train[batch_start:batch_end]
+
+            # instantiate training tensors
+            X_tensor = torch.tensor(X, device=device).float()
+            Y_tensor = torch.tensor(Y, dtype=torch.long, device=device)
+
+            # Pass input tensors thru 1 training step (fwd+backwards pass)
+            loss, acc = train_step(X_tensor, Y_tensor)
+
+            # aggregate batch accuracy to measure progress of entire epoch
+            epoch_acc += acc * actual_batch_size / train_size
+            epoch_loss += loss * actual_batch_size / train_size
+
+            # keep track of the iteration to see if the model's too slow
+            print('\r' + f'Epoch {epoch}: iteration {i}/{num_iterations}', end='')
+
+        # create tensors from validation set
+        X_valid_tensor = torch.tensor(X_valid, device=device).float()
+        Y_valid_tensor = torch.tensor(Y_valid, dtype=torch.long, device=device)
+
+        # calculate validation metrics to keep track of progress; don't need predictions now
+        valid_loss, valid_acc, _ = validate(X_valid_tensor, Y_valid_tensor)
+
+        # accumulate scalar performance metrics at each epoch to track and plot later
+        train_losses.append(epoch_loss)
+        valid_losses.append(valid_loss)
+
+        # Check if the current validation loss is better than the best loss
+        if valid_loss < best_loss:
+            best_loss = valid_loss
+            patience_counter = 0  # Reset the counter since the loss improved
+        else:
+            patience_counter += 1
+
+        # Check if the patience limit has been reached
+        if patience_counter >= patience:
+            print("Early stopping: No improvement in validation loss for {} epochs".format(patience))
+            break
+
+        # Save checkpoint of the model
+        # checkpoint_filename = '/content/drive/My Drive/DL/models/checkpoints/parallel_all_you_wantFINAL-{:03d}.pkl'.format(epoch)
+        # save_checkpoint(optimizer, model, epoch, checkpoint_filename)
+
+        # keep track of each epoch's progress
+        print(f'\nEpoch {epoch} --- loss:{epoch_loss:.3f}, Epoch accuracy:{epoch_acc:.2f}%, '
+              f'Validation loss:{valid_loss:.3f}, Validation accuracy:{valid_acc:.2f}%')
+
+# choose number of epochs higher than reasonable so we can manually stop training
+num_epochs = 500
+
+# train it!
+train(optimizer, model, num_epochs, X_train, y_train, X_valid, y_valid)
+
+# Define the file path where you want to save the model
+model_path = '/content/drive/MyDrive/Model_1_v2.pth'  # Change to your desired path and file name
+
+# Save the entire model
+torch.save(model.state_dict(), model_path)
+
+print("Model saved successfully at:", model_path)
+
+
+
+    
+    
